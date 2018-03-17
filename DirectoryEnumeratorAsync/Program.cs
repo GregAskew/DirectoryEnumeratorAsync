@@ -110,10 +110,16 @@
                             if (directoryExclusions.Any(x => childFileInfo.FullName.IndexOf(x, StringComparison.OrdinalIgnoreCase) > -1)) continue;
 
                             tasks.Add(
-                                Task.Factory.StartNew(async (x) => {
-                                    await GetFileSystemEntriesAsync(
-                                        childFileInfo, tasks, progress, directoryExclusions, fileSystemEntries);
-                                }, state: childFileInfo.FullName)
+                                Task.Factory.StartNew(
+                                    async (x) => {
+                                        await GetFileSystemEntriesAsync(
+                                            childFileInfo, tasks, progress, directoryExclusions, fileSystemEntries);
+                                    },
+                                    state: childFileInfo.FullName,
+                                    scheduler: TaskScheduler.Default,
+                                    cancellationToken: CancellationToken.None,
+                                    creationOptions: TaskCreationOptions.None
+                                )
                             );
                         }
                     }
