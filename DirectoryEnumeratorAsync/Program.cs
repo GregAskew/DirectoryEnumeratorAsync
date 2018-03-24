@@ -20,15 +20,22 @@
     /// </summary>
     class Program {
 
+        #region Members
         /// <summary>
         /// Directories to exclude from enumeration.
         /// </summary>
         private static IReadOnlyList<string> DirectoryExclusions { get; set; }
 
-        private static Stopwatch ElapsedTimer { get; set; }
-
         private static Stopwatch ProgressTimer { get; set; }
 
+        private static int TasksCompleted { get; set; }
+
+        private static int TasksCreated { get; set; }
+
+        private static object TasksCreatedCompletedLockObject = new object();
+        #endregion
+
+        #region Methods
         private static void CreateReport(ConcurrentDictionary<string, FileInfo> fileSystemEntries) {
 
             var rootElement = new XElement($"ArrayOfFileSystemEntries");
@@ -83,66 +90,83 @@
             }
             #endregion
 
-            if ((progress != null) && (fileSystemEntries.Count > 0)) {
-                int progressTimerTotalSeconds = (int)ProgressTimer.Elapsed.TotalSeconds;
-                if (progressTimerTotalSeconds == 60) {
-                    ProgressTimer.Restart();
-                    progress.Report(new FileSystemEnumerationProgress() { FileSystemEntries = fileSystemEntries.Count, CurrentFilePath = pathFileInfo.FullName });
-                }
-            }
-
-            await Task.Run(() => {
-                if (!pathFileInfo.Attributes.HasFlag(FileAttributes.Directory)) {
-                    throw new ArgumentException($"Path is not a directory: {pathFileInfo.FullName}");
-                }
-
-                foreach (var fileSystemEntryPath in Directory.EnumerateFileSystemEntries(
-                    pathFileInfo.FullName, "*", SearchOption.TopDirectoryOnly)) {
-                    FileInfo childFileInfo = null;
+            try {
+                await Task.Run(() => {
 
                     try {
-                        childFileInfo = new FileInfo(fileSystemEntryPath);
-                        FileInfo placeHolder = null;
-                        fileSystemEntries.AddOrUpdate(childFileInfo.FullName, childFileInfo, (TKey, TOldValue) => placeHolder);
+                        lock (TasksCreatedCompletedLockObject) {
+                            TasksCreated++;
+                        }
 
-                        if (childFileInfo.Attributes.HasFlag(FileAttributes.Directory)
-                        && !childFileInfo.Attributes.HasFlag(FileAttributes.ReparsePoint)) {
-                            if (directoryExclusions.Any(x => childFileInfo.FullName.IndexOf(x, StringComparison.OrdinalIgnoreCase) > -1)) continue;
+                        if ((progress != null) && (fileSystemEntries.Count > 0)) {
+                            lock (ProgressTimer) {
+                                int progressTimerTotalSeconds = (int)ProgressTimer.Elapsed.TotalSeconds;
+                                if (progressTimerTotalSeconds == 30) {
+                                    ProgressTimer.Restart();
+                                    progress.Report(new FileSystemEnumerationProgress() { FileSystemEntries = fileSystemEntries.Count, CurrentFilePath = pathFileInfo.FullName });
+                                }
+                            }
+                        }
 
-                            tasks.Add(
-                                Task.Factory.StartNew(
-                                    async (x) => {
-                                        await GetFileSystemEntriesAsync(
-                                            childFileInfo, tasks, progress, directoryExclusions, fileSystemEntries);
-                                    },
-                                    state: childFileInfo.FullName,
-                                    scheduler: TaskScheduler.Default,
-                                    cancellationToken: CancellationToken.None,
-                                    creationOptions: TaskCreationOptions.None
-                                )
-                            );
+                        if (!pathFileInfo.Attributes.HasFlag(FileAttributes.Directory)) {
+                            throw new ArgumentException($"Path is not a directory: {pathFileInfo.FullName}");
+                        }
+
+                        foreach (var fileSystemEntryPath in Directory.EnumerateFileSystemEntries(
+                            pathFileInfo.FullName, "*", SearchOption.TopDirectoryOnly)) {
+
+                            FileInfo childFileInfo = null;
+
+                            childFileInfo = new FileInfo(fileSystemEntryPath);
+                            FileInfo placeHolder = null;
+                            fileSystemEntries.AddOrUpdate(childFileInfo.FullName, childFileInfo, (TKey, TOldValue) => placeHolder);
+
+                            if (childFileInfo.Attributes.HasFlag(FileAttributes.Directory)
+                                && !childFileInfo.Attributes.HasFlag(FileAttributes.ReparsePoint)) {
+                                if (directoryExclusions.Any(x => childFileInfo.FullName.IndexOf(x, StringComparison.OrdinalIgnoreCase) > -1)) continue;
+
+                                tasks.Add(Task.Run(async () => {
+                                    await GetFileSystemEntriesAsync(
+                                        pathFileInfo: childFileInfo,
+                                        tasks: tasks,
+                                        progress: progress,
+                                        directoryExclusions: directoryExclusions,
+                                        fileSystemEntries: fileSystemEntries,
+                                        continueOnUnauthorizedAccessExceptions: continueOnUnauthorizedAccessExceptions,
+                                        continueOnPathTooLongExceptions: continueOnPathTooLongExceptions);
+
+                                }));
+                            } // if (childFileInfo.Attributes.HasFlag()
+                        } // foreach (var fileSystemEntryPath in Directory.EnumerateFileSystemEntries(
+                    }
+                    finally {
+                        lock (TasksCreatedCompletedLockObject) {
+                            TasksCompleted++;
                         }
                     }
-                    catch (UnauthorizedAccessException) {
-                        Console.ForegroundColor = ConsoleColor.Yellow;
-                        Console.WriteLine($"[ThreadId: {Thread.CurrentThread.ManagedThreadId}] {Extensions.CurrentMethodName()} Insufficient permissions to access path: {fileSystemEntryPath}");
-                        Console.ResetColor();
-                        if (!continueOnUnauthorizedAccessExceptions) throw;
-                    }
-                    catch (PathTooLongException) {
-                        Console.ForegroundColor = ConsoleColor.Yellow;
-                        Console.WriteLine($"[ThreadId: {Thread.CurrentThread.ManagedThreadId}] {Extensions.CurrentMethodName()} path too long: {fileSystemEntryPath}");
-                        Console.ResetColor();
-                        if (!continueOnPathTooLongExceptions) throw;
-                    }
-                    catch (Exception e) {
-                        Console.ForegroundColor = ConsoleColor.Red;
-                        Console.WriteLine($"[ThreadId: {Thread.CurrentThread.ManagedThreadId}] {Extensions.CurrentMethodName()} path: {pathFileInfo.FullName} child path: {fileSystemEntryPath} Exception: {e.VerboseExceptionString()}");
-                        Console.ResetColor();
-                        throw;
-                    }
-                }
-            });
+                }); // await Task.Run(() => {
+            }
+            catch (UnauthorizedAccessException e) {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"[ThreadId: {Thread.CurrentThread.ManagedThreadId}] {Extensions.CurrentMethodName()} pathFileInfo.FullName: {pathFileInfo.FullName} UnauthorizedAccessException: {e.Message ?? "NULL"}");
+                Console.ResetColor();
+                if (!continueOnUnauthorizedAccessExceptions) throw;
+            }
+            catch (PathTooLongException e) {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"[ThreadId: {Thread.CurrentThread.ManagedThreadId}] {Extensions.CurrentMethodName()} pathFileInfo.FullName: {pathFileInfo.FullName} PathTooLongException: {e.Message ?? "NULL"}");
+                Console.ResetColor();
+                if (!continueOnPathTooLongExceptions) throw;
+            }
+            catch (AggregateException ae) {
+                Debug.WriteLine($"InnerException count: {ae.Flatten().InnerExceptions.Count}");
+            }
+            catch (Exception e) {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"[ThreadId: {Thread.CurrentThread.ManagedThreadId}] {Extensions.CurrentMethodName()} path: {pathFileInfo.FullName} child path: {pathFileInfo.FullName} Exception: {e.VerboseExceptionString()}");
+                Console.ResetColor();
+                throw;
+            }
 
             return fileSystemEntries;
         }
@@ -180,7 +204,7 @@
                 pathToEnumerate = pathToEnumerate.Replace("\"", string.Empty);
             }
 
-            ElapsedTimer = Stopwatch.StartNew();
+            var stopwatch = Stopwatch.StartNew();
             ProgressTimer = Stopwatch.StartNew();
 
             Console.WriteLine($"{DateTime.Now.TimeOfDay.HMSFriendly()} Getting directories and files for path: {pathToEnumerate}");
@@ -197,17 +221,21 @@
                 var tasks = new ConcurrentBag<Task>();
 
                 var progress = new Progress<FileSystemEnumerationProgress>((reportedProgress) => {
-                    Console.WriteLine($"{DateTime.Now.TimeOfDay.HMSFriendly()} File system entries found: {reportedProgress.FileSystemEntries.ToString("N0")}; Total tasks: {tasks.Count.ToString("N0")}; Remaining tasks: {tasks.Where(x => !x.IsCompleted).Count().ToString("N0")}");
+                    Console.ForegroundColor = ConsoleColor.Cyan;
+                    Console.WriteLine($"{DateTime.Now.TimeOfDay.HMSFriendly()} File system entries found: {reportedProgress.FileSystemEntries.ToString("N0")}; TasksCreated: {TasksCreated}; TasksCompleted: {TasksCompleted}; Total tasks: {tasks.Count.ToString("N0")}");
                     Console.WriteLine($" Current Path: {reportedProgress.CurrentFilePath}");
+                    Console.ResetColor();
                 });
 
-                var getFileSystemEntriesTask = GetFileSystemEntriesAsync(
-                    pathFileInfo: new FileInfo(pathToEnumerate),
-                    tasks: tasks,
-                    progress: progress,
-                    directoryExclusions: DirectoryExclusions);
+                var getFileSystemEntriesTask = Task.Run(() =>
+                        GetFileSystemEntriesAsync(
+                            pathFileInfo: new FileInfo(pathToEnumerate),
+                            tasks: tasks,
+                            progress: progress,
+                            directoryExclusions: DirectoryExclusions));
 
                 tasks.Add(getFileSystemEntriesTask);
+
                 while (true) {
                     Task.WaitAll(tasks.ToArray());
                     // wait a few seconds and check if the task count increases. If it increases, continue waiting.
@@ -224,12 +252,16 @@
                 int reparsePointCount = fileSystemEntries.Where(x => x.Value.Attributes.HasFlag(FileAttributes.ReparsePoint)).Count();
                 int fileCount = fileSystemEntries.Count - (directoryCount + reparsePointCount);
 
-                Console.WriteLine($"{DateTime.Now.TimeOfDay.HMSFriendly()} Finished. Time required: {ElapsedTimer.Elapsed.HMSFriendly()} Total processor time: {Process.GetCurrentProcess().TotalProcessorTime.HMSFriendly()} PEAK memory used: {Process.GetCurrentProcess().PeakWorkingSet64.ToString("N0")}");
-                Console.WriteLine($"{DateTime.Now.TimeOfDay.HMSFriendly()} Directories: {directoryCount.ToString("N0")} Files: {fileCount.ToString("N0")} Reparse Points: {reparsePointCount.ToString("N0")}");
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"{DateTime.Now.TimeOfDay.HMSFriendly()} Finished. Time required: {stopwatch.Elapsed.DHMSFriendly()} Total processor time: {Process.GetCurrentProcess().TotalProcessorTime.DHMSFriendly()} PEAK memory used: {Process.GetCurrentProcess().PeakWorkingSet64.ToString("N0")}");
+                Console.WriteLine($"{DateTime.Now.TimeOfDay.HMSFriendly()} Total file system entries: {fileSystemEntries.Count} Files: {fileCount.ToString("N0")} Directories: {directoryCount.ToString("N0")} Reparse Points: {reparsePointCount.ToString("N0")}");
+                Console.WriteLine($"{DateTime.Now.TimeOfDay.HMSFriendly()} TasksCreated: {TasksCreated} TasksCompleted: {TasksCompleted}");
 
                 CreateReport(fileSystemEntries);
+                Console.ResetColor();
 
             }
         }
+        #endregion
     }
 }
